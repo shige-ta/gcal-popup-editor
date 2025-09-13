@@ -13,6 +13,10 @@
 (() => {
   const LOG_PREFIX = '[GCalPopupEditor]';
   const DEBUG = false;
+  // Title editor layout preferences
+  const TITLE_MIN_LINES = 5;      // default minimum visible lines
+  const TITLE_EXTRA_LINES = 4;    // extra breathing-space lines beyond content (increased)
+  const TITLE_MAX_LINES = 16;     // hard cap to avoid huge popups
 
   const log = (...args) => DEBUG && console.debug(LOG_PREFIX, ...args);
   const warn = (...args) => console.warn(LOG_PREFIX, ...args);
@@ -199,8 +203,9 @@
       .btn .ic { width:14px; height:14px; display:inline-block; }
       .content { padding: 10px; display:flex; flex-direction:column; gap:10px; }
       .field { position:relative; }
-      .field input { width:100%; font-size:13px; color:var(--gpe-fg); background: var(--gpe-bg); border:1px solid var(--gpe-border); border-radius:8px; padding: 16px 12px 10px 12px; outline:none; box-sizing:border-box; transition:border-color .15s ease; }
-      .field input:focus { border-color: var(--gpe-primary); }
+      .field input, .field textarea { width:100%; font-size:13px; color:var(--gpe-fg); background: var(--gpe-bg); border:1px solid var(--gpe-border); border-radius:8px; padding: 16px 12px 10px 12px; outline:none; box-sizing:border-box; transition:border-color .15s ease; }
+      .field textarea { resize:none; line-height:1.4; overflow:hidden; min-height: 120px; max-height: 420px; }
+      .field input:focus, .field textarea:focus { border-color: var(--gpe-primary); }
       .field label { position:absolute; left:12px; top:10px; font-size:12px; color:var(--gpe-muted); background:var(--gpe-bg); padding:0 4px; transform-origin:left top; transition: transform .12s ease, color .12s ease, top .12s ease; pointer-events:none; }
       .field.filled label, .field:focus-within label { top:-7px; transform: scale(.88); color: var(--gpe-primary); }
       .status { display:flex; align-items:center; gap:8px; padding: 8px 10px; border-top: 1px solid var(--gpe-border); font-size:11px; color:var(--gpe-muted); min-height: 18px; }
@@ -243,7 +248,7 @@
         </div>
         <div class="content">
           <div class="field f-title">
-            <input type="text" class="gpe-title" id="gpe-title" />
+            <textarea class="gpe-title" id="gpe-title" rows="5"></textarea>
             <label for="gpe-title">Title / タイトル</label>
           </div>
         </div>
@@ -305,14 +310,27 @@
       titleField.classList.toggle('filled', !!titleEl.value.trim());
     }
 
+    // Auto-grow textarea for long titles (default ~3 lines, up to ~12 lines)
+    function autoGrow(el) {
+      const cs = getComputedStyle(el);
+      const line = parseFloat(cs.lineHeight) || 18;
+      const min = TITLE_MIN_LINES * line + 24;  // min lines + padding
+      const max = TITLE_MAX_LINES * line + 24;  // max lines + padding
+      el.style.height = '0px';
+      // Add breathing-space lines regardless of current content height
+      const target = el.scrollHeight + (TITLE_EXTRA_LINES * line);
+      const h = Math.max(min, Math.min(max, target));
+      el.style.height = h + 'px';
+    }
+
     // Dirty state tracking
     const baseline = { title: titleEl.value };
     function dirty() { return titleEl.value !== baseline.title; }
     function updateDirty() { saveBtn.disabled = !dirty(); }
 
     // Wire inputs
-    ['input','change'].forEach(ev => titleEl.addEventListener(ev, () => { updateFilled(); updateDirty(); }));
-    updateFilled(); updateDirty();
+    ['input','change'].forEach(ev => titleEl.addEventListener(ev, () => { updateFilled(); updateDirty(); autoGrow(titleEl); }));
+    updateFilled(); autoGrow(titleEl); updateDirty();
 
     // Toggle show/hide
     toggleBtn.addEventListener('click', () => {
@@ -323,10 +341,28 @@
 
     // Keyboard shortcuts within shadow
     shadow.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); ui.trigger('save'); }
-      else if (e.key === 'Escape') { e.preventDefault(); ui.trigger('cancel'); }
-      else if (e.altKey && (e.key.toLowerCase() === 'r')) { e.preventDefault(); ui.trigger('reload'); }
-    });
+      const key = (e.key || '').toLowerCase();
+      const isIME = e.isComposing || e.keyCode === 229; // avoid Enter during IME composition
+      if ((e.ctrlKey || e.metaKey) && key === 's') { e.preventDefault(); ui.trigger('save'); return; }
+      if (e.key === 'Escape') { e.preventDefault(); ui.trigger('cancel'); return; }
+      if (e.altKey && key === 'r') { e.preventDefault(); ui.trigger('reload'); return; }
+      // Enter-to-save when editing title (no modifiers, not composing)
+      if (!isIME && e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        const inTitle = (shadow.activeElement === titleEl) || titleEl.contains(e.target);
+        if (inTitle && !saveBtn.disabled && !titleEl.disabled) { e.preventDefault(); ui.trigger('save'); }
+      }
+    }, { capture: false });
+
+    // Prevent arrow keys from bubbling to Calendar when editing title
+    shadow.addEventListener('keydown', (e) => {
+      const inTitle = (shadow.activeElement === titleEl) || titleEl.contains(e.target);
+      if (!inTitle) return;
+      const code = e.key;
+      if (!code) return;
+      if (code.startsWith('Arrow') || code === 'Home' || code === 'End' || code === 'PageUp' || code === 'PageDown') {
+        e.stopPropagation(); // allow caret move in textarea, but don't let Calendar handle it
+      }
+    }, { capture: true });
 
     // Save success check pulse helper
     ui.pulseCheck = () => { check.classList.remove('hidden'); setTimeout(() => check.classList.add('hidden'), 1200); };
@@ -380,7 +416,8 @@
         const titleInput = await waitFor(() => findTitleInput(), { timeout: 20000 });
 
         ui.setStatus('Updating title…');
-        setTextInputValue(titleInput, ui.title.value);
+        const normalizedTitle = (ui.title.value || '').replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        setTextInputValue(titleInput, normalizedTitle);
 
         // Save
         ui.setStatus('Saving…');
