@@ -363,6 +363,9 @@
       try {
         ui.setSaving(true);
         ui.setStatus('Opening editor…');
+        // Snapshot current route and scroll position(s)
+        const routeSnap = snapshotRoute();
+        const scrollSnap = snapshotCalendarScroll();
         let editBtn = findEditButton(popup);
         if (editBtn) {
           editBtn.click();
@@ -381,11 +384,33 @@
 
         // Save
         ui.setStatus('Saving…');
-        const saveBtn = await waitFor(() => findSaveButton(), { timeout: 15000 });
+        const saveBtn = await waitFor(() => findSaveButton(), { timeout: 12000 });
         triggerClick(saveBtn);
 
-        // Wait until editor closes
-        await waitFor(() => !isEditorOpen(), { timeout: 20000 });
+        // Non-blocking: auto-accept "送信/Send" prompt if it appears shortly
+        const stopPromptWatch = armAutoSendUpdatesPrompt(6000);
+
+        // Wait for Calendar to become idle (loading finished) with short timeout
+        await waitForCalendarIdle({ minQuietMs: 350, maxWaitMs: 12000 });
+        stopPromptWatch();
+
+        // Restore route (date/view) if changed, then restore scroll — triggered by idle
+        ui.setStatus('Restoring view…');
+        await restoreRouteSoft(routeSnap);
+
+        // If route still differs (Calendar jumped to today), navigate back hard and restore via sessionStorage
+        const after = snapshotRoute();
+        if (after !== routeSnap) {
+          setPendingRestore({ url: routeSnap, primaryTop: scrollSnap.primaryTop, win: scrollSnap.win, t: Date.now() });
+          location.assign(routeSnap);
+          return; // further logic will run after navigation via attemptApplyPendingRestore()
+        }
+
+        // Same route → just do in-place scroll restore
+        await restoreCalendarScrollWithRetries(scrollSnap);
+        if (typeof scrollSnap.primaryTop === 'number') {
+          lockCalendarScroll(scrollSnap.primaryTop, 1400);
+        }
         ui.setSaving(false);
         ui.setStatus('Saved');
         if (typeof ui.pulseCheck === 'function') ui.pulseCheck();
@@ -417,10 +442,262 @@
     el.focus();
   }
 
+  // --- Scroll position snapshot/restore ------------------------------------
+  function isScrollable(el) {
+    if (!el || !(el instanceof HTMLElement)) return false;
+    const cs = getComputedStyle(el);
+    const canY = (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+    const canX = (cs.overflowX === 'auto' || cs.overflowX === 'scroll') && el.scrollWidth > el.clientWidth;
+    return canX || canY;
+  }
+
+  function getScrollableAncestors(start) {
+    const list = [];
+    let n = start instanceof Node ? start.parentNode : null;
+    let hops = 0;
+    while (n && n !== document && hops < 10) {
+      if (n instanceof HTMLElement && isScrollable(n)) list.push(n);
+      n = n.parentNode;
+      hops++;
+    }
+    // Include page scroll element last
+    if (document.scrollingElement) list.push(document.scrollingElement);
+    return list;
+  }
+
+  function snapshotScroll(contextEl) {
+    return {
+      win: { x: window.scrollX, y: window.scrollY },
+      elems: getScrollableAncestors(contextEl).map(el => ({ el, top: el.scrollTop, left: el.scrollLeft }))
+    };
+  }
+
+  function restoreScrollOnce(snap) {
+    try { window.scrollTo(snap.win.x, snap.win.y); } catch {}
+    for (const s of snap.elems) {
+      const el = s.el;
+      if (!el || !document.documentElement.contains(el)) continue;
+      try {
+        if (typeof el.scrollTo === 'function') el.scrollTo({ left: s.left, top: s.top });
+        else { el.scrollLeft = s.left; el.scrollTop = s.top; }
+      } catch {}
+    }
+  }
+
+  async function restoreScrollWithRetries(snap, tries = 6, delay = 60) {
+    for (let i = 0; i < tries; i++) {
+      restoreScrollOnce(snap);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  // Calendar-specific primary scroller detection (handles overlay remount)
+  function findCalendarScrollCandidates() {
+    const sels = [
+      'main',
+      '[role="main"]',
+      'div[aria-label*="Calendar" i]',
+      'div[aria-label*="カレンダー" i]',
+      'div[aria-label*="Main" i]',
+      'div[aria-label*="メイン" i]'
+    ];
+    const set = new Set();
+    for (const sel of sels) document.querySelectorAll(sel)?.forEach(el => set.add(el));
+    const all = Array.from(set).filter(el => el instanceof HTMLElement && el.offsetParent !== null);
+    const scrollables = all.filter(isScrollable);
+    // If none matched, consider any large scrollable in document
+    const anyScrollables = scrollables.length ? scrollables : Array.from(document.querySelectorAll('div')).filter(isScrollable);
+    return anyScrollables;
+  }
+
+  function findPrimaryCalendarScroller() {
+    const cands = findCalendarScrollCandidates();
+    if (!cands.length) return null;
+    // Pick the tallest scroll area as the primary calendar scroller
+    return cands.reduce((best, el) => {
+      const span = (el.scrollHeight - el.clientHeight) + (el.scrollWidth - el.clientWidth);
+      return span > ((best?.span) || -1) ? { el, span } : best;
+    }, null)?.el || null;
+  }
+
+  function snapshotCalendarScroll() {
+    const primary = findPrimaryCalendarScroller();
+    return { primaryTop: primary ? primary.scrollTop : null, win: { x: window.scrollX, y: window.scrollY } };
+  }
+
+  async function restoreCalendarScrollWithRetries(snap, tries = 10, delay = 80) {
+    const prev = history.scrollRestoration;
+    try { history.scrollRestoration = 'manual'; } catch {}
+    for (let i = 0; i < tries; i++) {
+      const primary = findPrimaryCalendarScroller();
+      if (primary && typeof snap.primaryTop === 'number') {
+        try { primary.scrollTop = snap.primaryTop; } catch {}
+      }
+      try { window.scrollTo(snap.win.x, snap.win.y); } catch {}
+      await new Promise(r => setTimeout(r, delay));
+    }
+    try { history.scrollRestoration = prev; } catch {}
+  }
+
+  function lockCalendarScroll(targetTop, ms = 1200) {
+    const start = Date.now();
+    const handler = () => {
+      const el = findPrimaryCalendarScroller();
+      if (!el) return;
+      if (typeof targetTop === 'number' && Math.abs(el.scrollTop - targetTop) > 2) {
+        try { el.scrollTop = targetTop; } catch {}
+      }
+      if (Date.now() - start >= ms) clearInterval(timer);
+    };
+    const timer = setInterval(handler, 80);
+    handler();
+  }
+
+  // --- Route snapshot/restore (keep same date/view) ------------------------
+  function snapshotRoute() {
+    return location.pathname + location.search + location.hash;
+  }
+
+  async function restoreRouteSoft(prevUrl, waitMs = 120) {
+    const cur = location.pathname + location.search + location.hash;
+    if (cur === prevUrl) return false;
+    try {
+      history.replaceState(null, '', prevUrl);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    } catch {}
+    await new Promise(r => setTimeout(r, waitMs));
+    return true;
+  }
+
+  // Persisted restore across navigation
+  const RESTORE_SS_KEY = 'gpe:restore';
+  function setPendingRestore(payload) {
+    try { sessionStorage.setItem(RESTORE_SS_KEY, JSON.stringify(payload)); } catch {}
+  }
+  function consumePendingRestore() {
+    try {
+      const raw = sessionStorage.getItem(RESTORE_SS_KEY);
+      if (!raw) return null;
+      sessionStorage.removeItem(RESTORE_SS_KEY);
+      return JSON.parse(raw);
+    } catch { return null; }
+  }
+
+  async function attemptApplyPendingRestore() {
+    const rec = consumePendingRestore();
+    if (!rec) return;
+    // Only apply if URL matches what we expected to return to (best effort)
+    const cur = snapshotRoute();
+    if (rec.url && !cur.includes(rec.url)) {
+      // Different route than expected; still try scroll
+    }
+    const snap = { primaryTop: rec.primaryTop ?? null, win: rec.win || { x: 0, y: 0 } };
+    try {
+      await waitFor(() => findPrimaryCalendarScroller(), { timeout: 7000, interval: 80 });
+    } catch {}
+    await restoreCalendarScrollWithRetries(snap, 12, 80);
+    if (typeof snap.primaryTop === 'number') lockCalendarScroll(snap.primaryTop, 1600);
+  }
+
   function isEditorOpen() {
     // Look for large dialog with inputs
     const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[role="region"]'));
     return dialogs.some(d => d.offsetParent !== null && d.querySelector('input, textarea, [contenteditable="true"]'));
+  }
+
+  function isAnyDialogOpen() {
+    const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[role="region"]'));
+    return dialogs.some(d => d.offsetParent !== null);
+  }
+
+  function findUpdatePromptDialog() {
+    const dlg = Array.from(document.querySelectorAll('div[role="dialog"], div[role="region"]'))
+      .find(d => d.offsetParent !== null && /update|send|guest|更新|送信|ゲスト/i.test(d.textContent || ''));
+    return dlg || null;
+  }
+
+  function chooseInDialog(dlg, prefs = { action: 'send' }) {
+    const buttons = Array.from(dlg.querySelectorAll('button, div[role="button"]')).filter(isVisible);
+    const byText = (rxList) => buttons.find(b => rxList.some(rx => rx.test((b.textContent || '').trim())));
+    if (prefs.action === 'send') {
+      const btn = byText([/^send$/i, /^送信$/, /^更新を送信/, /^ゲストに送信/]);
+      if (btn) return btn;
+    }
+    if (prefs.action === 'dontsend') {
+      const btn = byText([/don't\s*send/i, /^送信しない$/]);
+      if (btn) return btn;
+    }
+    // Fallback: primary-looking button
+    return buttons.find(b => b.getAttribute('data-mdc-dialog-action') === 'accept') || buttons[0] || null;
+  }
+
+  async function handleUpdatePromptPreferSend({ timeout = 8000 } = {}) {
+    // Wait briefly for the prompt to appear
+    let dlg = null;
+    try {
+      dlg = await waitFor(() => findUpdatePromptDialog(), { timeout, interval: 150 });
+    } catch { /* none */ }
+    if (!dlg) return false;
+    const btn = chooseInDialog(dlg, { action: 'send' });
+    if (btn) {
+      triggerClick(btn);
+      // Wait for the dialog to close
+      try { await waitFor(() => !dlg.isConnected || dlg.offsetParent === null, { timeout: 6000 }); } catch {}
+      return true;
+    }
+    return false;
+  }
+
+  // Non-blocking watcher: auto-click "送信/Send" if the prompt appears
+  function armAutoSendUpdatesPrompt(durationMs = 6000) {
+    const mo = new MutationObserver(() => {
+      const dlg = findUpdatePromptDialog();
+      if (!dlg) return;
+      const btn = chooseInDialog(dlg, { action: 'send' });
+      if (btn) triggerClick(btn);
+    });
+    try { mo.observe(document.body, { childList: true, subtree: true }); } catch {}
+    const timer = setTimeout(() => mo.disconnect(), durationMs);
+    return () => { clearTimeout(timer); mo.disconnect(); };
+  }
+
+  function findToastElement() {
+    // Look for aria-live alerts, often contain "Undo/元に戻す" or "Saved/保存"
+    const cands = Array.from(document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"], [role="alert"]')).filter(isVisible);
+    return cands.find(el => /undo|saved|updated|保存|更新|元に戻す/i.test(el.textContent || '')) || null;
+  }
+
+  async function waitForSavedToast({ timeout = 15000 } = {}) {
+    try {
+      const el = await waitFor(() => findToastElement(), { timeout, interval: 150 });
+      // Give it a moment to settle
+      await new Promise(r => setTimeout(r, 200));
+      return !!el;
+    } catch { return false; }
+  }
+
+  // Detect Calendar loading/busy state and resolve when it becomes idle
+  function findVisibleProgressIndicator() {
+    const bars = Array.from(document.querySelectorAll('[role="progressbar"], .progress, .loading'))
+      .filter(isVisible);
+    // Filter out tiny decorative elements
+    return bars.find(el => el.getBoundingClientRect().width > 20 || el.getBoundingClientRect().height > 6) || null;
+  }
+
+  async function waitForCalendarIdle({ minQuietMs = 400, maxWaitMs = 12000 } = {}) {
+    let last = Date.now();
+    const mo = new MutationObserver(() => { last = Date.now(); });
+    try { mo.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: false }); } catch {}
+    const start = Date.now();
+    try {
+      while (Date.now() - start < maxWaitMs) {
+        const busy = isAnyDialogOpen() || !!findVisibleProgressIndicator();
+        const quietEnough = (Date.now() - last) >= minQuietMs;
+        if (!busy && quietEnough) { mo.disconnect(); return true; }
+        await new Promise(r => setTimeout(r, 120));
+      }
+    } finally { try { mo.disconnect(); } catch {} }
+    return false;
   }
 
   function findTitleInput() {
@@ -474,6 +751,8 @@
   }
 
   function boot() {
+    // If we just returned to a saved URL, restore scroll ASAP
+    attemptApplyPendingRestore();
     // Initial sweep
     findQuickPopupDialogs().forEach(d => {
       try { injectEditorIntoPopup(d); } catch (e) { warn('inject failed', e); }
