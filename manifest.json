@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "GCal Popup Editor",
+  "description": "Edit Google Calendar event title and description directly from the quick popup by automating the official UI (no API).",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://calendar.google.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://calendar.google.com/*"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "css": [
+        "src/content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "GCal Popup Editor"
+  },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": false
+  }
+}
+
