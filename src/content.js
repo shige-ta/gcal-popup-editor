@@ -240,6 +240,10 @@
               <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
               <span>Cancel</span>
             </button>
+            <button class="btn ghost" data-action="toggle-check" title="タイトル先頭に✅を付ける/外す">
+              <span class="ic">✅</span>
+              <span>先頭チェック</span>
+            </button>
             <button class="btn primary" data-action="save" title="Save (Ctrl/Cmd+S)" disabled>
               <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M17 3H5c-1.1 0-2 .9-2 2v14l4-4h10c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
               <span>Save</span>
@@ -273,6 +277,7 @@
     const saveBtn = wrap.querySelector('button[data-action="save"]');
     const cancelBtn = wrap.querySelector('button[data-action="cancel"]');
     const reloadBtn = wrap.querySelector('button[data-action="reload"]');
+    const checkBtn = wrap.querySelector('button[data-action="toggle-check"]');
 
     const ui = {
       host,
@@ -280,7 +285,7 @@
       root: wrap,
       title: titleEl,
       status: statusText,
-      buttons: { save: saveBtn, cancel: cancelBtn, reload: reloadBtn, toggle: toggleBtn },
+      buttons: { save: saveBtn, cancel: cancelBtn, reload: reloadBtn, toggle: toggleBtn, check: checkBtn },
       on(action, fn) {
         wrap.addEventListener('click', (e) => {
           const btn = e.target.closest('button[data-action]');
@@ -338,6 +343,21 @@
       ui.setCollapsed(collapsed);
     });
     ui.setCollapsed(false);
+
+    // Toggle checkmark prefix button
+    checkBtn.addEventListener('click', () => {
+      const raw = titleEl.value || '';
+      const trimmedLeft = raw.replace(/^\s+/, '');
+      let next;
+      if (/^✅\s?/.test(trimmedLeft)) {
+        next = trimmedLeft.replace(/^✅\s?/, '');
+      } else {
+        next = '✅ ' + trimmedLeft;
+      }
+      titleEl.value = next;
+      updateFilled(); updateDirty(); autoGrow(titleEl);
+      try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch {}
+    });
 
     // Keyboard shortcuts within shadow
     shadow.addEventListener('keydown', (e) => {
